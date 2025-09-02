@@ -4,6 +4,7 @@ import scipy.stats as stats
 from pathlib import Path
 import pickle
 import numpy as np
+from itertools import permutations
 
 from votekit.ballot_generator import (
     ImpartialAnonymousCulture,
@@ -16,8 +17,10 @@ from votekit.ballot_generator import (
     slate_PlackettLuce,
     slate_BradleyTerry,
     name_Cumulative,
+    k_slate_BradleyTerry,
     sample_cohesion_ballot_types,
 )
+
 from votekit.pref_profile import PreferenceProfile
 from votekit.pref_interval import PreferenceInterval, combine_preference_intervals
 from votekit import Ballot
@@ -978,3 +981,115 @@ def test_slate_BT_distribution():
 
     # Test
     assert do_ballot_probs_match_ballot_dist(ballot_prob_dict, pp)
+
+def test_k_slate_BT_k3_distribution():
+    sbt = k_slate_BradleyTerry(
+        # > 2 slates (k=3)
+        slate_to_candidates={
+            "slate1": ["X", "Y"],
+            "slate2": ["Z"],
+            "slate3": ["W"],
+        },
+
+        # cohesion parameters (loyalty to different slates)
+        cohesion_parameters={
+            "bloc1": {"slate1": 0.7, "slate2": 0.2, "slate3": 0.1},
+            "bloc2": {"slate1": 0.7, "slate2": 0.2, "slate3": 0.1},
+            "bloc3": {"slate1": 0.7, "slate2": 0.2, "slate3": 0.1},
+        },
+
+        bloc_voter_prop={"bloc1": 0.8, "bloc2": 0.2, "bloc3": 0.0},
+
+        # Voter bloc preference for candidates within each slate
+        pref_intervals_by_bloc={
+            "bloc1": {
+                "slate1": PreferenceInterval({"X": 0.9, "Y": 0.1}),
+                "slate2": PreferenceInterval({"Z": 1.0}),
+                "slate3": PreferenceInterval({"W": 1.0}),
+            },
+            "bloc2": {
+                "slate1": PreferenceInterval({"X": 0.9, "Y": 0.1}),
+                "slate2": PreferenceInterval({"Z": 1.0}),
+                "slate3": PreferenceInterval({"W": 1.0}),
+            },
+            "bloc3": {
+                "slate1": PreferenceInterval({"X": 0.9, "Y": 0.1}),
+                "slate2": PreferenceInterval({"Z": 1.0}),
+                "slate3": PreferenceInterval({"W": 1.0}),
+            },
+        },
+
+        # List of all candidates
+        candidates=["X", "Y", "Z", "W"],
+    )
+
+    # DETERMINISTIC TEST:
+
+    # Generate preference profile
+    pp = sbt.generate_profile(number_of_ballots=600, deterministic=True)
+
+    cand_to_slate = {"X": "slate1", "Y": "slate1", "Z": "slate2", "W": "slate3"}
+    alpha = sbt._alpha_by_bloc["bloc1"]
+    pi_slate1 = sbt.pref_intervals_by_bloc["bloc1"]["slate1"].interval
+
+    ballot_prob_dict = {}
+    for ranking in permutations(["X", "Y", "Z", "W"],r=4):
+        # Interleaving weight (k-way BT over slate labels)
+        sequence = [cand_to_slate[c] for c in ranking]
+        w = 1.0
+        for i in range(len(sequence) - 1):
+            ai = sequence[i]
+            ai_a = alpha[ai]
+            for j in range(i + 1, len(sequence)):
+                bj = sequence[j]
+                if bj != ai:
+                    w *= ai_a / (ai_a + alpha[bj]) 
+
+        s1_subsequence = [c for c in ranking if cand_to_slate[c] == "slate1"]
+        if len(s1_subsequence) == 2:
+            denominator = pi_slate1["X"] + pi_slate1["Y"]
+            within = pi_slate1[s1_subsequence[0]] / denominator
+        else:
+            within = 1.0
+
+        ballot_prob_dict["".join(ranking)] = w * within
+
+    # Test
+    assert do_ballot_probs_match_ballot_dist(ballot_prob_dict, pp)
+
+
+    # NON-DETERMINISTIC TEST:
+
+    # Generate preference profile
+    pp = sbt.generate_profile(number_of_ballots=600, deterministic=False)
+
+    cand_to_slate = {"X": "slate1", "Y": "slate1", "Z": "slate2", "W": "slate3"}
+    alpha = sbt._alpha_by_bloc["bloc1"]
+    pi_slate1 = sbt.pref_intervals_by_bloc["bloc1"]["slate1"].interval
+
+    ballot_prob_dict = {}
+    for ranking in permutations(["X", "Y", "Z", "W"], 4):
+        # Interleaving weight (k-way BT over slate labels)
+        seq = [cand_to_slate[c] for c in ranking]
+        w = 1.0
+        for i in range(len(seq) - 1):
+            ai = seq[i]
+            ai_a = alpha[ai]
+            for j in range(i + 1, len(seq)):
+                bj = seq[j]
+                if bj != ai:
+                    w *= ai_a / (ai_a + alpha[bj])
+
+        # Within-slate ordering
+        s1_subseq = [c for c in ranking if cand_to_slate[c] == "slate1"]
+        if len(s1_subseq) == 2:
+            denominator = pi_slate1["X"] + pi_slate1["Y"]
+            within = pi_slate1[s1_subseq[0]] / denominator
+        else:
+            within = 1.0
+
+        ballot_prob_dict["".join(ranking)] = w * within
+
+    # Test
+    assert do_ballot_probs_match_ballot_dist(ballot_prob_dict, pp)
+

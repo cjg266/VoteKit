@@ -1956,7 +1956,345 @@ class slate_BradleyTerry(BallotGenerator):
         # else return the combined profiles
         else:
             return pp
+        
 
+class k_slate_BradleyTerry(BallotGenerator):
+    """
+    Class for generating ballots using a slate-BradleyTerry model. It does so by combining two stochastic components:
+    first, it samples inter-state ordering using Plackett-Luce, then it samples within-state ordering using Bradley-Terry
+
+    Can be initialized with an interval or can be constructed with the Dirichlet distribution using
+    the `from_params` method of `BallotGenerator`.
+
+    Args:
+        slate_to_candidates (dict): Dictionary whose keys are bloc names and whose
+            values are lists of candidate strings that make up the slate.
+        bloc_voter_prop (dict): Dictionary whose keys are bloc strings and values are floats
+                denoting population share.
+        pref_intervals_by_bloc (dict): Dictionary whose keys are bloc strings and values are
+            dictionaries whose keys are bloc strings and values are ``PreferenceInterval`` objects.
+        cohesion_parameters (dict): Dictionary mapping of bloc string to dictionary whose
+            keys are bloc strings and values are cohesion parameters,
+            eg. ``{'bloc_1': {'bloc_1': .7, 'bloc_2': .2, 'bloc_3':.1}}``
+
+    Attributes:
+        candidates (list): List of candidate strings.
+        slate_to_candidates (dict): Dictionary whose keys are bloc names and whose
+            values are lists of candidate strings that make up the slate.
+        bloc_voter_prop (dict): Dictionary whose keys are bloc strings and values are floats
+                denoting population share.
+        pref_intervals_by_bloc (dict): Dictionary whose keys are bloc strings and values are
+            dictionaries whose keys are bloc strings and values are ``PreferenceInterval`` objects.
+        cohesion_parameters (dict): Dictionary mapping of bloc string to dictionary whose
+            keys are bloc strings and values are cohesion parameters,
+            eg. ``{'bloc_1': {'bloc_1': .7, 'bloc_2': .2, 'bloc_3':.1}}``
+    """
+
+    def __init__(self, cohesion_parameters: dict, **data):
+        super().__init__(cohesion_parameters=cohesion_parameters, **data)
+
+        self.voter_blocs = list(self.bloc_voter_prop.keys())
+        try:
+            self.slates = list(self.slate_to_candidates.keys()) 
+        except: 
+            raise ValueError("k_slate_BradleyTerry requires a slate_to_candidates dictionary.")
+
+        # Validate slate labels are the same in pref_intervals_by_bloc and cohesion_parameters
+        # Each preference interval bloc should be indexed by the slates it has preferences for
+        # Each cohesion parameter bloc should be indexed by the slates it has cohesion params for
+        slates_set = set(self.slates)
+        for bloc in self.voter_blocs:
+
+            pref_interval_keys  = set(self.pref_intervals_by_bloc[bloc].keys())
+            if pref_interval_keys != slates_set:
+                raise ValueError(
+                    f"pref_intervals_by_bloc[{bloc}] keys {sorted(pref_interval_keys)} != slates {sorted(slates_set)}"
+                )
+            
+            cohesion_keys = set(self.cohesion_parameters[bloc].keys())
+            if cohesion_keys != slates_set:
+                raise ValueError(
+                    f"cohesion_parameters[{bloc}] keys {sorted(cohesion_keys)} != slates {sorted(slates_set)}"
+                )
+
+        # Cache counts of non-zero support candidates, M (summation of non-zero support counts), and alpha for each bloc
+        self._counts_by_bloc = {bloc: self._counts_for_bloc(bloc) for bloc in self.voter_blocs}
+        self._M_by_bloc = {bloc: sum(self._counts_by_bloc[bloc].values()) for bloc in self.voter_blocs}
+        self._alpha_by_bloc  = {bloc: self._alpha_vec(bloc) for bloc in self.voter_blocs}
+
+        self._deterministic_threshold = 12
+        self.ballot_type_pdf = {}
+        for bloc in self.voter_blocs:
+            if self._M_by_bloc[bloc] <= self._deterministic_threshold and self._M_by_bloc[bloc] > 0:
+                self.ballot_type_pdf[bloc] = self._compute_ballot_type_dist_k(bloc)
+
+    def _alpha_vec(self, bloc: str) -> dict:
+        """
+        Compute alpha (support) vector for bloc to be used in Bradley-Terry model where the support vector represents the weight of each slate.
+        Mathematically, alpha = cohesion_parameters / sum(cohesion_parameters) for each bloc over all slates.
+
+        Args:
+            bloc (str): voter bloc label.
+
+        Returns:
+            dict: alpha (support) vector for bloc.
+        """
+        alpha_vector = {slate: float(self.cohesion_parameters[bloc][slate]) for slate in self.slates}
+        total = sum(alpha_vector.values())
+        return {slate: alpha_vector[slate] / total for slate in alpha_vector}
+
+    def _counts_for_bloc(self, bloc: str) -> dict:
+        """
+        Counts of non-zero support candidates per slate for this bloc.
+
+        Args: 
+            bloc (str): voter bloc label.
+
+        Returns:
+            dict: counts of non-zero support candidates per slate for this bloc
+        """
+        pref_interval_for_bloc = self.pref_intervals_by_bloc[bloc]
+        return {slate: len(pref_interval_for_bloc[slate].non_zero_cands) for slate in self.slates}
+
+    def _zero_cands_union(self, bloc: str) -> set:
+        """
+        Aggregates all zero-support candidates across all slates for this bloc
+
+        Args:
+            bloc (str): voter bloc label.
+
+        Returns:
+            set: union of zero-support candidates across all slates for this bloc
+        """
+        pref_interval_for_bloc = self.pref_intervals_by_bloc[bloc]
+        return set().union(*(pref_interval_for_bloc[slate].zero_cands for slate in self.slates))
+
+    def _interleaving_weight(self, sequence: tuple, alpha: dict) -> float:
+        """
+        Interleaving weight for a sequence of slate labels.
+        Mathematically, interleaving weight = product of ai / (ai + aj) for all i < j in sequence.
+
+        Args:
+            sequence (tuple): sequence of slate labels.
+            alpha (dict): alpha (support) vector for bloc.
+
+        Returns:
+            float: interleaving weight of the sequence.
+        """
+
+        weight = 1.0
+        big_M = len(sequence)
+
+        for i in range(big_M - 1):
+
+            slate_i = sequence[i]
+            alpha_slate_i = alpha[slate_i]
+
+            for j in range(i + 1, big_M):
+                slate_j = sequence[j]
+                if slate_j != slate_i:
+                    weight *= alpha_slate_i / (alpha_slate_i + alpha[slate_j])
+
+        return weight
+
+    def _compute_ballot_type_dist_k(self, bloc: str) -> dict:
+        """
+        Exact pmf over slate-label sequences for bloc (feasible only when M <= threshold).
+
+        Args:
+            bloc (str): voter bloc label.
+
+        Returns:
+            dict: pmf over slate sequences for bloc
+        """
+        alpha = self._alpha_by_bloc.get(bloc) # self._alpha_vec(bloc)
+        counts = self._counts_by_bloc.get(bloc) # self._counts_for_bloc(bloc)
+        labels = [slate for slate, n in counts.items() for _ in range(n)]
+
+        if not labels:
+            return {(): 1.0}
+        pdf = {}
+        
+        # Enumerate unique permutations of the multiset
+        for sequence in set(it.permutations(labels, len(labels))):
+            weight = self._interleaving_weight(sequence, alpha)
+            if weight > 0.0:
+                pdf[sequence] = weight
+
+        total = sum(pdf.values())
+        if total <= 0:
+            u = 1.0 / max(1, len(pdf))
+            return {k: u for k in pdf.keys()}
+        return {k: v / total for k, v in pdf.items()}
+
+    def _sample_ballot_types_deterministic(self, bloc: str, num_ballots: int):
+        """
+        Sample slate-label sequences for a bloc using precomputed exact pmf.
+
+        Args:
+            bloc (str): voter bloc label.
+            num_ballots (int): number of ballots to sample.
+
+        Returns:
+            list: list of slate-labels sampled for the bloc.
+        """
+        pdf = self.ballot_type_pdf.get(bloc)
+
+        if not pdf:
+            raise ValueError("Deterministic sampling requires M <= deterministic_threshold for the bloc. Set deterministic=False to use the MCMC sampler.")
+        
+        # Sample from the exact pmf
+        ballot_types = list(pdf.keys())
+        probs = np.asarray([pdf[b_type] for b_type in ballot_types], dtype=float)
+        probs = probs / probs.sum()
+        index = np.random.choice(len(ballot_types), size=num_ballots, p=probs)
+        return [ballot_types[i] for i in index]
+
+    def _sample_ballot_types_MCMC(self, bloc: str, num_ballots: int, verbose: bool = False):
+        """
+        Adjacent-swap MH chain for ordering slate labels within a bloc.
+        Accept swap (a,b) with min(1, alpha_b/alpha_a).
+
+        Args:
+            bloc (str): the bloc to sample from.
+            num_ballots (int): the number of ballots to generate.
+            verbose (bool, optional): whether to print progress. Defaults to False.
+
+        Returns:
+            list: a list of ballots.
+        """
+        # Counts and alpha vector for bloc 
+        counts = self._counts_by_bloc.get(bloc)
+        alpha  = self._alpha_by_bloc.get(bloc)
+
+        # Seed
+        seed = [slate for slate, n in counts.items() for _ in range(n)]
+        if not seed:
+            return [()] * num_ballots
+
+        ballots = [None] * num_ballots
+        num_accepted= 0
+        current= seed[:]
+        L = len(current)
+
+        # Sample swap positions
+        swap_indices = [(j, j + 1) for j in np.random.choice(L - 1, size=num_ballots)]
+
+        for i in range(num_ballots):
+            j1, j2 = swap_indices[i]
+            a, b = current[j1], current[j2]
+            if a == b:
+                accept_prob = 1.0 # always accept swap if identical slate
+            else:
+                accept_prob = min(1.0, alpha[b] / alpha[a])
+
+            if random.random() < accept_prob:
+                current[j1], current[j2] = b, a
+                num_accepted += 1
+
+            ballots[i] = tuple(current)
+
+        if verbose:
+            print(f"Acceptance rate: {num_accepted/num_ballots:.2f}")
+
+        return ballots
+
+    def generate_profile(
+        self, number_of_ballots: int, by_bloc: bool = False, deterministic: bool = True
+    ) -> Union[PreferenceProfile, Tuple]:
+        """
+        Generate ballots per voter bloc, then aggregate.
+        Deterministic path requires (for each bloc g) M_g <= self._deterministic_threshold.
+
+        Args:
+            number_of_ballots (int): The number of ballots to generate.
+            by_bloc (bool): True if you want the generated profiles returned as a tuple
+                ``(pp_by_bloc, pp)``, where ``pp_by_bloc`` is a dictionary with keys = bloc strings
+                and values = ``PreferenceProfile`` and ``pp`` is the aggregated profile. False if
+                you only want the aggregated profile. Defaults to False.
+            deterministic (bool): True if you want to use precise pdf, False to use MCMC sampling.
+                Defaults to True.
+
+        Returns:
+            PreferenceProfile: The aggregated profile.
+            Tuple: ``(pp_by_bloc, pp)``, where ``pp_by_bloc`` is a dictionary with keys = bloc
+                strings and values = ``PreferenceProfile`` and ``pp`` is the aggregated 
+        """
+        # Apportion ballots across voter blocs 
+        bloc_props = [self.bloc_voter_prop[b] for b in self.voter_blocs]
+        ballots_per_bloc = dict(
+            zip(self.voter_blocs, apportion.compute("huntington", bloc_props, number_of_ballots))
+        )
+
+        # Generate ballots
+        pref_profile_by_bloc = {}
+
+        for bloc in self.voter_blocs:
+            num_ballots = ballots_per_bloc[bloc]
+            ballots = [Ballot()] * num_ballots
+
+            pref_intervals = self.pref_intervals_by_bloc[bloc]
+            zero_cands = self._zero_cands_union(bloc)
+
+            M = self._M_by_bloc.get(bloc)
+            if M is None:
+                M = sum(len(pref_intervals[s].non_zero_cands) for s in self.slates)
+
+            # Choose interleaver
+            if deterministic:
+                # Use precomputed pmf if available o.w. compute 
+                if bloc not in self.ballot_type_pdf:
+                    self.ballot_type_pdf[bloc] = self._compute_ballot_type_dist_k(bloc)
+                interleaving_sequences = self._sample_ballot_types_deterministic(bloc=bloc, num_ballots=num_ballots)
+            else:
+                interleaving_sequences = self._sample_ballot_types_MCMC(bloc=bloc, num_ballots=num_ballots)
+
+            # Within slate order
+            for j, sequence in enumerate(interleaving_sequences):
+                per_slate_order = {}
+                for slate in self.slates:
+                    candidates = list(pref_intervals[slate].non_zero_cands)
+
+                    if len(candidates) > 0: # If there exists non-zero support candidates
+                        # weights from the bloc's preference interval
+                        weights = {candidate: pref_intervals[slate].interval[candidate] for candidate in candidates}
+                        order = []
+                        pool_of_candidates = candidates[:]
+
+                        while len(pool_of_candidates) > 0:
+
+                            weights_sum = sum(weights[candidate] for candidate in pool_of_candidates)
+                            probabilities = [weights[candidate] / weights_sum for candidate in pool_of_candidates]
+                            index = np.random.choice(len(pool_of_candidates), p=probabilities)
+                            chosen_candidate = pool_of_candidates.pop(index)
+                            order.append(chosen_candidate)
+
+                        per_slate_order[slate] = order
+
+                    else:
+                        per_slate_order[slate] = []
+
+                # Fill according to the interleaving sequence
+                ranking_list = []
+                for slate in sequence:
+                    ranking_list.append(frozenset({per_slate_order[slate].pop(0)}))
+
+                # Append zero-support candidates (all tied) to the end
+                if zero_cands:
+                    ranking_list.append(frozenset(zero_cands))
+
+                ballots[j] = Ballot(ranking=tuple(ranking_list), weight=1)
+
+            pp = PreferenceProfile(ballots=tuple(ballots)).group_ballots()
+            pref_profile_by_bloc[bloc] = pp
+
+        # Aggregate blocs
+        pp_total = PreferenceProfile()
+        for profile in pref_profile_by_bloc.values():
+            pp_total += profile
+
+        return (pref_profile_by_bloc, pp_total) if by_bloc==True else pp_total
+    
 
 class Spatial(BallotGenerator):
     """
