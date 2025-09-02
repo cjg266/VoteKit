@@ -2007,15 +2007,25 @@ class k_slate_BradleyTerry(BallotGenerator):
 
             pref_interval_keys  = set(self.pref_intervals_by_bloc[bloc].keys())
             if pref_interval_keys != slates_set:
-                raise ValueError(
-                    f"pref_intervals_by_bloc[{bloc}] keys {sorted(pref_interval_keys)} != slates {sorted(slates_set)}"
-                )
+                raise ValueError(f"pref_intervals_by_bloc[{bloc}] keys {sorted(pref_interval_keys)} != slates {sorted(slates_set)}")
             
             cohesion_keys = set(self.cohesion_parameters[bloc].keys())
             if cohesion_keys != slates_set:
-                raise ValueError(
-                    f"cohesion_parameters[{bloc}] keys {sorted(cohesion_keys)} != slates {sorted(slates_set)}"
-                )
+                raise ValueError(f"cohesion_parameters[{bloc}] keys {sorted(cohesion_keys)} != slates {sorted(slates_set)}")
+            
+        # Validate sum of cohesion parameters for each bloc is 1
+        for bloc in self.voter_blocs:
+            cohesion_sum = sum(self.cohesion_parameters[bloc].values())
+            if not np.isclose(cohesion_sum, 1.0):
+                raise ValueError(f"Sum of cohesion parameters for bloc {bloc} is {cohesion_sum}, but should be 1.0")
+            
+        # Validate sum of pref interval probabilities for each bloc by each slate is 1
+        for bloc in self.voter_blocs:
+            for state in self.slates:
+                pref_interval_sum = sum(self.pref_intervals_by_bloc[bloc][state].interval.values())
+                if not np.isclose(pref_interval_sum, 1.0):
+                    raise ValueError(f"Sum of preference interval probabilities for bloc {bloc} is {pref_interval_sum}, but should be 1.0")
+
 
         # Cache counts of non-zero support candidates, M (summation of non-zero support counts), and alpha for each bloc
         self._counts_by_bloc = {bloc: self._counts_for_bloc(bloc) for bloc in self.voter_blocs}
@@ -2024,9 +2034,15 @@ class k_slate_BradleyTerry(BallotGenerator):
 
         self._deterministic_threshold = 12
         self.ballot_type_pdf = {}
+
         for bloc in self.voter_blocs:
-            if self._M_by_bloc[bloc] <= self._deterministic_threshold and self._M_by_bloc[bloc] > 0:
+            # Precompute exact pmf if candidates number <= threshold / only 1 slates
+            if self._M_by_bloc[bloc] <= self._deterministic_threshold:
                 self.ballot_type_pdf[bloc] = self._compute_ballot_type_dist_k(bloc)
+            # Else, use MCMC sampler
+            else: 
+                warnings.warn(f"For bloc {bloc}, M = {self._M_by_bloc[bloc]} > {self._deterministic_threshold}, so exact sampling is computationally infeasible. Please set deterministic = False when calling generate_profile.")
+            
 
     def _alpha_vec(self, bloc: str) -> dict:
         """
@@ -2053,8 +2069,7 @@ class k_slate_BradleyTerry(BallotGenerator):
         Returns:
             dict: counts of non-zero support candidates per slate for this bloc
         """
-        pref_interval_for_bloc = self.pref_intervals_by_bloc[bloc]
-        return {slate: len(pref_interval_for_bloc[slate].non_zero_cands) for slate in self.slates}
+        return {slate: len(self.pref_intervals_by_bloc[bloc][slate].non_zero_cands) for slate in self.slates}
 
     def _zero_cands_union(self, bloc: str) -> set:
         """
@@ -2066,8 +2081,7 @@ class k_slate_BradleyTerry(BallotGenerator):
         Returns:
             set: union of zero-support candidates across all slates for this bloc
         """
-        pref_interval_for_bloc = self.pref_intervals_by_bloc[bloc]
-        return set().union(*(pref_interval_for_bloc[slate].zero_cands for slate in self.slates))
+        return set().union(*(self.pref_intervals_by_bloc[bloc][slate].zero_cands for slate in self.slates))
 
     def _interleaving_weight(self, sequence: tuple, alpha: dict) -> float:
         """
@@ -2107,14 +2121,14 @@ class k_slate_BradleyTerry(BallotGenerator):
         Returns:
             dict: pmf over slate sequences for bloc
         """
-        alpha = self._alpha_by_bloc.get(bloc) # self._alpha_vec(bloc)
-        counts = self._counts_by_bloc.get(bloc) # self._counts_for_bloc(bloc)
+        alpha = self._alpha_by_bloc.get(bloc)
+        counts = self._counts_by_bloc.get(bloc)
         labels = [slate for slate, n in counts.items() for _ in range(n)]
 
         if not labels:
             return {(): 1.0}
-        pdf = {}
         
+        pdf = {}
         # Enumerate unique permutations of the multiset
         for sequence in set(it.permutations(labels, len(labels))):
             weight = self._interleaving_weight(sequence, alpha)
